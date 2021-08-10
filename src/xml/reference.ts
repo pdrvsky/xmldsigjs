@@ -80,6 +80,8 @@ export class Reference extends XmlSignatureObject {
     })
     public DigestValue: Uint8Array;
 
+    public DigestSource: ArrayBuffer;
+
     constructor(uri?: string) {
         super();
         if (uri) {

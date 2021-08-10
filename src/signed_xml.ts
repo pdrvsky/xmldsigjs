@@ -44,6 +44,21 @@ export interface OptionsSignReference {
      * List of transforms
      */
     transforms?: OptionsSignTransform[];
+    /**
+     * File buffer to calculate digest from. Used
+     * only in Detached mode
+     *
+     * @type {ArrayBuffer}
+     * @memberOf OptionsSignReference
+     */
+    digestSource?: ArrayBuffer;
+    /**
+     * File digest. Used only in detached mode
+     *
+     * @type {ArrayBuffer}
+     * @memberOf OptionsSignReference
+     */
+    digestValue?: ArrayBuffer;
 }
 
 export interface OptionsSign {
@@ -173,6 +188,62 @@ export class SignedXml implements XmlCore.IXmlSerializable {
         if (XmlCore.isElement(data)) {
             this.document = data.ownerDocument;
         }
+        return this.XmlSignature;
+    }
+
+    public async SignDetached(algorithm: Algorithm | EcdsaParams | RsaPssParams, key: CryptoKey, options: OptionsSign = {}) {
+        let alg: ISignatureAlgorithm;
+        let signedInfo: SignedInfo;
+        const signingAlg = XmlCore.assign({}, algorithm);
+
+        // @ts-ignore
+        if (key.algorithm["hash"]) {
+            // @ts-ignore
+            signingAlg.hash = key.algorithm["hash"];
+        }
+        alg = CryptoConfig.GetSignatureAlgorithm(signingAlg);
+        await this.ApplySignOptions(this.XmlSignature, algorithm, key, options);
+
+        signedInfo = this.XmlSignature.SignedInfo;
+
+        await this.DigestDetachedReferences();
+
+        // Add signature method
+        signedInfo.SignatureMethod.Algorithm = alg.namespaceURI;
+        if (alg instanceof RsaPssBase) {
+            // Add RSA-PSS params
+            const alg2 = XmlCore.assign({}, key.algorithm, signingAlg);
+            if (typeof alg2.hash === "string") {
+                alg2.hash = { name: alg2.hash };
+            }
+            const params = new KeyInfos.PssAlgorithmParams(alg2);
+            this.XmlSignature.SignedInfo.SignatureMethod.Any.Add(params);
+        } else if (Alg.HMAC.toUpperCase() === algorithm.name.toUpperCase()) {
+            // Add HMAC params
+            let outputLength = 0;
+            const hmacAlg = key.algorithm as any;
+            switch (hmacAlg.hash.name.toUpperCase()) {
+                case Alg.SHA1:
+                    outputLength = hmacAlg.length || 160;
+                    break;
+                case Alg.SHA256:
+                    outputLength = hmacAlg.length || 256;
+                    break;
+                case Alg.SHA384:
+                    outputLength = hmacAlg.length || 384;
+                    break;
+                case Alg.SHA512:
+                    outputLength = hmacAlg.length || 512;
+                    break;
+            }
+            this.XmlSignature.SignedInfo.SignatureMethod.HMACOutputLength = outputLength;
+        }
+        const si = this.TransformSignedInfo();
+        const signature = await alg.Sign(si, key, signingAlg);
+
+        this.Key = key;
+        this.XmlSignature.SignatureValue = new Uint8Array(signature);
+        // this.document = data;
         return this.XmlSignature;
     }
 
@@ -434,6 +505,29 @@ export class SignedXml implements XmlCore.IXmlSerializable {
         return digest.Digest(canonOutput);
     }
 
+    protected async DigestDetachedReferences() {
+        for (const ref of this.XmlSignature.SignedInfo.References.GetIterator()) {
+            if (ref.DigestValue) {
+                // Skip digest calculating if reference has got a DigestValue
+                continue;
+            }
+            // assume SHA-256 if nothing is specified
+            if (!ref.DigestMethod.Algorithm) {
+                ref.DigestMethod.Algorithm = new Alg.Sha256().namespaceURI;
+            }
+
+            if (!ref.DigestSource) {
+                // @ts-ignore
+                ref.DigestValue = await this.DigestReference(undefined, ref, false);
+                continue;
+            }
+
+            const digest = CryptoConfig.CreateHashAlgorithm(ref.DigestMethod.Algorithm);
+            const hash = await digest.Digest(ref.DigestSource);
+            ref.DigestValue = hash;
+        }
+    }
+
     protected async DigestReferences(data: DigestReferenceSource) {
         // we must tell each reference which hash algorithm to use
         // before asking for the SignedInfo XML !
@@ -619,6 +713,15 @@ export class SignedXml implements XmlCore.IXmlSerializable {
                 if (item.type) {
                     reference.Type = item.type;
                 }
+                // DigestSource
+                if (item.digestSource) {
+                    reference.DigestSource = item.digestSource;
+                }
+                // DigestValue
+                if (item.digestValue) {
+                    reference.DigestValue = new Uint8Array(item.digestValue);
+                }
+
                 // DigestMethod
                 const digestAlgorithm = CryptoConfig.GetHashAlgorithm(item.hash);
                 reference.DigestMethod.Algorithm = digestAlgorithm.namespaceURI;
